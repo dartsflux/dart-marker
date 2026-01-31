@@ -63,7 +63,9 @@ def clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
 
-def normalize_bbox(x1: int, y1: int, x2: int, y2: int, w: int, h: int) -> Optional[Tuple[int, int, int, int]]:
+def normalize_bbox(
+    x1: int, y1: int, x2: int, y2: int, w: int, h: int
+) -> Optional[Tuple[int, int, int, int]]:
     x1, x2 = sorted((x1, x2))
     y1, y2 = sorted((y1, y2))
 
@@ -138,7 +140,10 @@ def load_ann(path: Path) -> List[DartAnn]:
     if not path.exists():
         return []
 
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
 
     # New format
     if "darts" in data and isinstance(data.get("darts"), list):
@@ -159,7 +164,7 @@ def load_ann(path: Path) -> List[DartAnn]:
     # Old format (single dart at top-level)
     bbox = data.get("bbox")
     tip = data.get("tip")
-    tail = data.get("tail")  # might not exist in old
+    tail = data.get("tail")
     if bbox is None and tip is None and tail is None:
         return []
 
@@ -262,74 +267,6 @@ def _draw_panel_bottom_left(out: np.ndarray, lines: List[str]) -> None:
         y += line_h
 
 
-def _safe_crop(img: np.ndarray, cx: int, cy: int, r: int) -> np.ndarray:
-    h, w = img.shape[:2]
-    cx = clamp(cx, 0, w - 1)
-    cy = clamp(cy, 0, h - 1)
-
-    x1 = clamp(cx - r, 0, w - 1)
-    x2 = clamp(cx + r, 0, w - 1)
-    y1 = clamp(cy - r, 0, h - 1)
-    y2 = clamp(cy + r, 0, h - 1)
-
-    crop = img[y1 : y2 + 1, x1 : x2 + 1]
-
-    target = 2 * r + 1
-    pad_top = max(0, r - (cy - y1))
-    pad_left = max(0, r - (cx - x1))
-    pad_bottom = max(0, target - crop.shape[0] - pad_top)
-    pad_right = max(0, target - crop.shape[1] - pad_left)
-
-    if pad_top or pad_left or pad_bottom or pad_right:
-        crop = cv2.copyMakeBorder(
-            crop, pad_top, pad_bottom, pad_left, pad_right, borderType=cv2.BORDER_REPLICATE
-        )
-    return crop
-
-
-def _draw_lens(out: np.ndarray, cx: int, cy: int, zoom: int = 4, r: int = 16) -> None:
-    h, w = out.shape[:2]
-    R = r
-    ZOOM = zoom
-    BORDER = 2
-    PAD = 8
-    SHOW_SIZE = (2 * R + 1) * ZOOM
-
-    crop = _safe_crop(out, cx, cy, R)
-    zoomed = cv2.resize(crop, (SHOW_SIZE, SHOW_SIZE), interpolation=cv2.INTER_NEAREST)
-
-    mid = SHOW_SIZE // 2
-    cv2.line(zoomed, (mid, 0), (mid, SHOW_SIZE - 1), (255, 255, 255), 1)
-    cv2.line(zoomed, (0, mid), (SHOW_SIZE - 1, mid), (255, 255, 255), 1)
-    cv2.rectangle(
-        zoomed,
-        (mid - ZOOM // 2, mid - ZOOM // 2),
-        (mid + ZOOM // 2, mid + ZOOM // 2),
-        (0, 255, 255),
-        1,
-    )
-
-    lx = cx + 24
-    ly = cy - SHOW_SIZE - 24
-    if lx + SHOW_SIZE + 2 * BORDER + PAD > w:
-        lx = cx - (SHOW_SIZE + 24)
-    if ly < PAD:
-        ly = cy + 24
-
-    lx = clamp(lx, PAD, max(PAD, w - SHOW_SIZE - 2 * BORDER - PAD))
-    ly = clamp(ly, PAD, max(PAD, h - SHOW_SIZE - 2 * BORDER - PAD))
-
-    x1, y1 = lx, ly
-    x2, y2 = lx + SHOW_SIZE + 2 * BORDER, ly + SHOW_SIZE + 2 * BORDER
-
-    overlay = out.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
-
-    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
-    out[y1 + BORDER : y1 + BORDER + SHOW_SIZE, x1 + BORDER : x1 + BORDER + SHOW_SIZE] = zoomed
-
-
 def _draw_toast(out: np.ndarray, msg: str) -> None:
     if not msg:
         return
@@ -379,7 +316,7 @@ def draw_overlay(img: np.ndarray, st: State) -> np.ndarray:
     item = st.items[st.idx]
     hud = [
         f"{st.idx+1}/{len(st.items)}  {item.img_path.name}  {'*' if st.dirty else ''}",
-        f"ann: {item.ann_path.name}",
+        f"ann: {item.ann_path}",
         f"darts: {len(st.darts)}  current: {st.current+1 if st.darts else 0}",
         f"mode: {'TIP' if st.tip_mode else ('TAIL' if st.tail_mode else 'BBOX')}",
         "SPACE next | b prev | s save | z save-zero+next | x reject+next | q quit",
@@ -388,9 +325,6 @@ def draw_overlay(img: np.ndarray, st: State) -> np.ndarray:
         "drag LMB draws bbox (when not in tip/tail mode)",
     ]
     _draw_panel_bottom_left(out, hud)
-
-    if st.paused and (st.tip_mode or st.tail_mode) and st.mouse_xy is not None:
-        _draw_lens(out, st.mouse_xy[0], st.mouse_xy[1], zoom=4, r=16)
 
     if st.msg_ttl > 0:
         _draw_toast(out, st.message)
@@ -402,40 +336,101 @@ def draw_overlay(img: np.ndarray, st: State) -> np.ndarray:
 # -----------------------------
 # Dataset scan
 # -----------------------------
-def scan_dataset_roots(roots: List[Path]) -> List[Item]:
-    items: List[Item] = []
-    exts = {".jpg", ".jpeg", ".png", ".webp"}
+def _is_inside(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
 
-    for root in roots:
-        if not root.exists():
+
+def scan_dataset_roots(data_root: Path) -> List[Item]:
+    """
+    Preferred layout:
+      annotations/data/<session>/<cam>/images/*.jpg
+      annotations/data/<session>/<cam>/ann/*.json
+
+    Also supports flat layout:
+      annotations/data/<session>/<cam>/*.jpg + *.json
+    """
+    items: List[Item] = []
+    img_exts = {".jpg", ".jpeg", ".png", ".webp"}
+
+    if not data_root.exists():
+        return items
+
+    # Prefer scanning for ".../images/*.jpg"
+    for img_path in sorted(data_root.rglob("images/*")):
+        if img_path.suffix.lower() not in img_exts:
+            continue
+        # Skip anything already rejected (paranoia)
+        if "rejected" in [p.name for p in img_path.parents]:
             continue
 
-        for session in sorted([p for p in root.iterdir() if p.is_dir()]):
-            img_dir = session / "images"
-            ann_dir = session / "ann"
-            if not img_dir.exists():
-                continue
-            ann_dir.mkdir(parents=True, exist_ok=True)
+        images_dir = img_path.parent              # .../images
+        cam_dir = images_dir.parent               # .../<cam>
+        ann_dir = cam_dir / "ann"                 # .../<cam>/ann
+        ann_path = ann_dir / f"{img_path.stem}.json"
+        items.append(Item(img_path=img_path, ann_path=ann_path))
 
-            for img_path in sorted([p for p in img_dir.iterdir() if p.suffix.lower() in exts]):
-                ann_path = ann_dir / (img_path.stem + ".json")
-                items.append(Item(img_path=img_path, ann_path=ann_path))
+    if items:
+        return items
+
+    # Fallback: flat dirs that contain images directly
+    for cam_dir in sorted(p for p in data_root.rglob("*") if p.is_dir()):
+        if "rejected" in [p.name for p in cam_dir.parents] or cam_dir.name == "rejected":
+            continue
+        imgs = sorted(p for p in cam_dir.iterdir() if p.is_file() and p.suffix.lower() in img_exts)
+        if not imgs:
+            continue
+        for img_path in imgs:
+            ann_path = cam_dir / f"{img_path.stem}.json"
+            items.append(Item(img_path=img_path, ann_path=ann_path))
 
     return items
+
+
+def compute_rejected_paths(img_path: Path, ann_path: Path, data_root: Path, rejected_root: Path) -> Tuple[Path, Path]:
+    """
+    Map:
+      annotations/data/<session>/<cam>/images/<file>.jpg
+      annotations/data/<session>/<cam>/ann/<file>.json
+    -> annotations/rejected/<session>/<cam>/images/<file>.jpg
+       annotations/rejected/<session>/<cam>/ann/<file>.json
+    """
+    # img leaf: .../data/<session>/<cam>/images/file.jpg  => rel = <session>/<cam>/images/file.jpg
+    try:
+        rel_img = img_path.resolve().relative_to(data_root.resolve())
+    except Exception:
+        # Fallback: keep last 4 parts if something odd
+        rel_img = Path(*img_path.parts[-4:])
+
+    # Replace "images" or flat with proper destination layout
+    # We want base = <session>/<cam>
+    parts = list(rel_img.parts)
+    if len(parts) >= 3 and parts[-2] == "images":
+        base_rel = Path(*parts[:-2])  # <session>/<cam>
+    else:
+        # flat: <session>/<cam>/<file>.jpg
+        base_rel = Path(*parts[:-1])
+
+    dst_img_dir = rejected_root / base_rel / "images"
+    dst_ann_dir = rejected_root / base_rel / "ann"
+    dst_img = dst_img_dir / img_path.name
+    dst_ann = dst_ann_dir / ann_path.name
+    return dst_img, dst_ann
 
 
 # -----------------------------
 # Main loop
 # -----------------------------
 def main() -> int:
-    roots = [
-        # Path("datasets/dart_pose_kpt"),
-        # Path("datasets/dart_tip_kpt"),
-        Path("datasets/dart_pose_jan_28"),
-    ]
-    items = scan_dataset_roots(roots)
+    DATA_ROOT = Path("annotations/data")
+    REJECTED_ROOT = Path("annotations/rejected")
+
+    items = scan_dataset_roots(DATA_ROOT)
     if not items:
-        print("[ERR] No images found. Expected datasets/dart_pose_kpt/*/images and/or datasets/dart_tip_kpt/*/images")
+        print(f"[ERR] No images found under: {DATA_ROOT}")
         return 1
 
     st = State(items=items, idx=0)
@@ -450,8 +445,10 @@ def main() -> int:
         if img is None:
             print(f"[WARN] Could not read image: {item.img_path}")
             return False
+
         st.frame = img
         st.h, st.w = img.shape[:2]
+
         st.darts = load_ann(item.ann_path)
         st.current = 0
         st.tip_mode = False
@@ -464,6 +461,12 @@ def main() -> int:
         st.pending_confirm_key = None
         st.message = ""
         st.msg_ttl = 0
+
+        if item.ann_path.exists() and not st.darts:
+            set_msg(st, "Loaded ann but 0 darts", ttl=60)
+        if not item.ann_path.exists():
+            set_msg(st, "No ann file (new frame?)", ttl=60)
+
         return True
 
     def select_dart_by_click(x: int, y: int) -> None:
@@ -478,10 +481,6 @@ def main() -> int:
         st.pending_confirm_key = None
 
     def require_confirm(keycode: int, action_desc: str) -> bool:
-        """
-        If dirty, require pressing the same key twice.
-        Returns True if action should proceed now.
-        """
         if not st.dirty:
             return True
         if st.pending_confirm_key == keycode:
@@ -507,37 +506,28 @@ def main() -> int:
     def reject_current_and_next() -> None:
         item = st.items[st.idx]
 
-        # Put rejects next to the SESSION folder (…/<session>/rejects/images + ann)
-        # session = …/<session>/images/<file>
-        session_dir = item.img_path.parent.parent
-        rej_img_dir = session_dir / "rejects" / "images"
-        rej_ann_dir = session_dir / "rejects" / "ann"
-        rej_img_dir.mkdir(parents=True, exist_ok=True)
-        rej_ann_dir.mkdir(parents=True, exist_ok=True)
+        dst_img, dst_ann = compute_rejected_paths(item.img_path, item.ann_path, DATA_ROOT, REJECTED_ROOT)
+        dst_img.parent.mkdir(parents=True, exist_ok=True)
+        dst_ann.parent.mkdir(parents=True, exist_ok=True)
 
-        # Ensure ann exists (save current state first if you want; here we keep disk ann as-is if exists)
-        if st.dirty:
-            # if dirty, we DO NOT silently save. user should confirm.
-            pass
-
-        # move files
-        dst_img = rej_img_dir / item.img_path.name
-        dst_ann = rej_ann_dir / item.ann_path.name
-
+        # move image
         try:
             shutil.move(str(item.img_path), str(dst_img))
         except Exception as e:
             print(f"[ERR] Failed moving image: {e}")
 
+        # move or create ann
         if item.ann_path.exists():
             try:
                 shutil.move(str(item.ann_path), str(dst_ann))
             except Exception as e:
                 print(f"[ERR] Failed moving ann: {e}")
         else:
-            # create empty ann in rejects to keep pairs
+            # create empty ann in rejected to keep pairs
             save_ann(dst_ann, dst_img, st.idx, st.w, st.h, [])
-        print(f"[REJECT] Moved to {dst_img} (and ann)")
+
+        print(f"[REJECT] {item.img_path.name} -> {dst_img}")
+        set_msg(st, f"Rejected -> {dst_img}", ttl=80)
 
         # remove from list and stay at same index (now points to next item)
         st.items.pop(st.idx)
@@ -588,7 +578,11 @@ def main() -> int:
                 st.drawing = False
                 st.drag_end = (x, y)
                 if st.drag_start and st.drag_end:
-                    nb = normalize_bbox(st.drag_start[0], st.drag_start[1], st.drag_end[0], st.drag_end[1], st.w, st.h)
+                    nb = normalize_bbox(
+                        st.drag_start[0], st.drag_start[1],
+                        st.drag_end[0], st.drag_end[1],
+                        st.w, st.h
+                    )
                     if nb is not None:
                         cur.bbox = nb
                         mark_dirty()
@@ -606,7 +600,6 @@ def main() -> int:
         cv2.imshow(win, view)
 
         key = cv2.waitKey(10) & 0xFF
-
         if key in (0, 255):
             continue
 
@@ -677,7 +670,6 @@ def main() -> int:
 
         # save-zero + next
         if key == ord("z"):
-            # this is an action that *saves*, so it clears dirty automatically
             save_current([])  # darts: []
             jump(+1)
             continue

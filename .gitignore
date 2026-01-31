@@ -7,3 +7,6 @@ data/sessions/**/output*
 
 annotations/
 videos/
+datasets/
+
+yolov8s-pose.pt

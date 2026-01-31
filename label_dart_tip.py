@@ -153,18 +153,28 @@ def ensure_dirs(base_dir: Path) -> Tuple[Path, Path]:
     return img_dir, ann_dir
 
 
-def compute_output_dir(video_path: Path, out_root: Path) -> Path:
+def derive_session_cam(video_path: Path) -> Tuple[str, str]:
     """
-    Example:
-      --video ../../footage/data/sessions/20260128_024058/cam1.mp4
-      => datasets/20260128_024058/cam1/
-    We interpret:
-      session = video_path.parent.name
-      filename = video_path.stem
+    Typical input:
+      .../videos/20260128_024058/cam1.mp4
+    => session='20260128_024058', cam='cam1'
+
+    We use:
+      session = parent folder name
+      cam = file stem
     """
     session = video_path.parent.name
-    filename = video_path.stem
-    return out_root / session / filename
+    cam = video_path.stem
+    return session, cam
+
+
+def compute_output_dir(video_path: Path, out_data_root: Path) -> Path:
+    """
+    New layout:
+      annotations/data/{session}/{cam}/
+    """
+    session, cam = derive_session_cam(video_path)
+    return out_data_root / session / cam
 
 
 def ensure_current_dart(st: LabelState) -> None:
@@ -265,6 +275,7 @@ def save_annot(
         "empty": empty,
         "darts": darts_out,
     }
+    ann_dir.mkdir(parents=True, exist_ok=True)
     ann_path.write_text(json.dumps(ann, indent=2), encoding="utf-8")
     print(f"[OK] Saved {img_path.name} (+ ann, darts={len(darts_out)}, empty={empty})")
     return img_path, ann_path, empty, len(darts_out)
@@ -274,14 +285,11 @@ def save_annot(
 # Drawing / HUD
 # -----------------------------
 def _draw_kp(out: np.ndarray, x: int, y: int, label: str, color: Tuple[int, int, int], scale: float = 0.55) -> None:
-    """
-    Draw keypoint as: tiny center dot + small square box around it + label.
-    """
     h, w = out.shape[:2]
     x = clamp(x, 0, w - 1)
     y = clamp(y, 0, h - 1)
 
-    KP_BOX = 10  # half-size: square is (2*KP_BOX+1)
+    KP_BOX = 10
     x1 = clamp(x - KP_BOX, 0, w - 1)
     y1 = clamp(y - KP_BOX, 0, h - 1)
     x2 = clamp(x + KP_BOX, 0, w - 1)
@@ -303,9 +311,6 @@ def _draw_kp(out: np.ndarray, x: int, y: int, label: str, color: Tuple[int, int,
 
 
 def _draw_hud_bottom_left(out: np.ndarray, lines: List[str]) -> None:
-    """
-    Draw HUD at bottom-left with a translucent dark panel.
-    """
     h, w = out.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.55
@@ -337,9 +342,6 @@ def _draw_hud_bottom_left(out: np.ndarray, lines: List[str]) -> None:
 
 
 def _draw_toast_top(out: np.ndarray, text: str) -> None:
-    """
-    Draw a 'toast' message at top-center.
-    """
     if not text:
         return
     h, w = out.shape[:2]
@@ -369,7 +371,6 @@ def _draw_toast_top(out: np.ndarray, text: str) -> None:
 
 
 def _safe_crop(img: np.ndarray, cx: int, cy: int, r: int) -> np.ndarray:
-    """Crop a (2r+1)x(2r+1) around (cx,cy), clamped to image bounds (pads by edge)."""
     h, w = img.shape[:2]
     cx = clamp(cx, 0, w - 1)
     cy = clamp(cy, 0, h - 1)
@@ -396,9 +397,6 @@ def _safe_crop(img: np.ndarray, cx: int, cy: int, r: int) -> np.ndarray:
 
 
 def _draw_lens(out: np.ndarray, cx: int, cy: int) -> None:
-    """
-    Draw a magnifier lens near the cursor. Draw this LAST so it overlays everything.
-    """
     h, w = out.shape[:2]
 
     R = 16
@@ -465,7 +463,6 @@ def draw_overlay(
     out = canvas.copy()
     h, w = out.shape[:2]
 
-    # ROI display
     if roi is not None:
         rx1, ry1, rx2, ry2 = roi
         rx1 = clamp(rx1, 0, w - 1)
@@ -484,11 +481,9 @@ def draw_overlay(
                 2,
             )
 
-    # Only ensure a dart exists if we actually have any, or if user is in a mode that needs it
     if st.darts or st.tip_mode or st.tail_mode or st.drawing:
         ensure_current_dart(st)
 
-    # preview bbox while dragging
     if st.drawing and st.drag_start and st.drag_end:
         x1, y1 = st.drag_start
         x2, y2 = st.drag_end
@@ -497,7 +492,6 @@ def draw_overlay(
             x1, y1, x2, y2 = nb
             cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
-    # draw darts (optionally hide non-current)
     for i, d in enumerate(st.darts):
         if st.hide_others and i != st.current:
             continue
@@ -536,11 +530,9 @@ def draw_overlay(
     ]
     _draw_hud_bottom_left(out, hud_lines)
 
-    # toast (SAVED / HIDE ON/OFF etc.)
     if toast_active(st):
         _draw_toast_top(out, st.toast.text)
 
-    # lens last
     if st.paused and (st.tip_mode or st.tail_mode) and st.mouse_xy is not None:
         mx, my = st.mouse_xy
         _draw_lens(out, mx, my)
@@ -552,27 +544,23 @@ def draw_overlay(
 # Main
 # -----------------------------
 def main() -> int:
-    global last_saved_darts  # IMPORTANT: we mutate the module-level cache
+    global last_saved_darts
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True, help="Path to mp4")
-    ap.add_argument("--out", default="datasets", help="Output root folder (default: datasets)")
+    ap.add_argument("--out", default="annotations/data", help="Output root folder (default: annotations/data)")
     ap.add_argument("--start-frame", type=int, default=0, help="Start from this frame index")
     ap.add_argument("--prefix", default="frame_", help="Filename prefix (default: frame_)")
 
-    # auto-save extra frames after labeling
     ap.add_argument("--after-count", type=int, default=2, help="How many extra frames to save after current (default 2)")
     ap.add_argument("--after-step", type=int, default=4, help="Frame step between extras (default 4)")
 
-    # playback
     ap.add_argument("--delay-ms", type=int, default=25, help="Playback delay in ms while playing (default 25)")
     ap.add_argument("--paused-delay-ms", type=int, default=10, help="UI delay in ms while paused (default 10)")
 
-    # auto-pause on stable dart (frame-to-frame motion)
     ap.add_argument("--auto-pause", action="store_true", help="Auto-pause when motion settles (dart likely stuck)")
     ap.add_argument("--stable-frames", type=int, default=10, help="Consecutive stable frames before pausing (default 10)")
 
-    # robust motion metric
     ap.add_argument("--downscale", type=float, default=0.33, help="Downscale ROI for motion metric (default 0.33)")
     ap.add_argument("--blur", type=int, default=5, help="Gaussian blur kernel (odd). 0 disables. (default 5)")
     ap.add_argument("--diff-px", type=int, default=12, help="Per-pixel diff threshold for 'changed' (default 12)")
@@ -583,7 +571,6 @@ def main() -> int:
     ap.add_argument("--cooldown-frames", type=int, default=20, help="Cooldown after autopause (default 20)")
     ap.add_argument("--motion-debug", action="store_true", help="Print per-frame motion debug logs")
 
-    # empty frames
     ap.add_argument("--allow-empty", action="store_true", help="(kept for compatibility) allow saving empty frames")
     ap.add_argument("--save-empty-key", default="x", help="Key to save an empty frame quickly (default: x)")
 
@@ -594,11 +581,10 @@ def main() -> int:
     allow_empty = True
 
     video_path = Path(args.video).expanduser()
-    out_root = Path(args.out)
-    out_dir = compute_output_dir(video_path, out_root)
+    out_data_root = Path(args.out)
+    out_dir = compute_output_dir(video_path, out_data_root)
     img_dir, ann_dir = ensure_dirs(out_dir)
 
-    # motion-based auto-pause state
     event_active = False
     stable_count = 0
     cooldown = 0
@@ -613,7 +599,6 @@ def main() -> int:
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, 1280, 720)
 
-    # Seek to start frame (best-effort)
     if args.start_frame > 0:
         cap.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
         st.frame_idx = args.start_frame - 1
@@ -639,7 +624,6 @@ def main() -> int:
         return True
 
     def select_dart_by_click(x: int, y: int) -> None:
-        # When hide_others is ON, other darts are not selectable (as requested)
         if st.hide_others:
             return
         for i in range(len(st.darts) - 1, -1, -1):
@@ -655,39 +639,28 @@ def main() -> int:
         h, w = st.frame.shape[:2]
         st.mouse_xy = (clamp(x, 0, w - 1), clamp(y, 0, h - 1))
 
-        # If we are going to edit (tip/tail/bbox), ensure there is a current dart
-        needs_current = (
-            event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN, cv2.EVENT_LBUTTONUP, cv2.EVENT_MOUSEMOVE)
-            and (st.tip_mode or st.tail_mode or st.drawing or True)
-        )
-        if needs_current and (st.tip_mode or st.tail_mode or st.drawing or event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN)):
+        if (st.tip_mode or st.tail_mode or st.drawing) and not st.darts:
             ensure_current_dart(st)
 
-        # If still no darts (possible when user wants empty frames), bail safely
         if not st.darts:
             return
         cur = st.darts[st.current]
 
-        # Click inside bbox selects dart (when not drawing) - but disabled if hide_others is ON
         if event == cv2.EVENT_LBUTTONDOWN and not st.drawing:
             select_dart_by_click(x, y)
 
-        # Right click always sets tip on current dart
         if event == cv2.EVENT_RBUTTONDOWN:
             cur.tip = (clamp(x, 0, w - 1), clamp(y, 0, h - 1))
             return
 
-        # Tail mode: left click sets tail
         if st.tail_mode and event == cv2.EVENT_LBUTTONDOWN:
             cur.tail = (clamp(x, 0, w - 1), clamp(y, 0, h - 1))
             return
 
-        # Tip mode: left click sets tip
         if st.tip_mode and event == cv2.EVENT_LBUTTONDOWN:
             cur.tip = (clamp(x, 0, w - 1), clamp(y, 0, h - 1))
             return
 
-        # Bbox draw (when not in tip/tail mode)
         if (not st.tip_mode) and (not st.tail_mode):
             if event == cv2.EVENT_LBUTTONDOWN:
                 st.drawing = True
@@ -723,7 +696,7 @@ def main() -> int:
         if key in (ord("q"), 27):
             break
 
-        if key == ord(" "):  # pause/resume
+        if key == ord(" "):
             st.paused = not st.paused
             st.tip_mode = False
             st.tail_mode = False
@@ -805,7 +778,6 @@ def main() -> int:
                 continue
 
             if key == ord(args.save_empty_key.lower()):
-                # force mark this frame as empty by clearing darts
                 st.darts = []
                 st.current = 0
                 st.tip_mode = False
@@ -820,7 +792,7 @@ def main() -> int:
                     continue
 
                 save_annot(img_dir, ann_dir, st.frame, st.frame_idx, st.darts, args.prefix)
-                last_saved_darts = []  # don't copy-forward darts after a negative save
+                last_saved_darts = []
                 set_toast(st, "SAVED (EMPTY)", 900)
                 continue
 
@@ -842,7 +814,6 @@ def main() -> int:
                 reset_frame_labels(st)
                 continue
 
-        # Playing mode
         if not st.paused:
             if not read_next_frame():
                 print("End of video.")
@@ -909,7 +880,6 @@ def main() -> int:
                             stable_count = 0
                             cooldown = args.cooldown_frames
 
-                            # copy-forward if available, else reset
                             if last_saved_darts:
                                 st.darts = clone_darts(last_saved_darts)
                                 st.current = max(0, len(st.darts) - 1)
