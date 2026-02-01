@@ -92,6 +92,10 @@ def point_in_bbox(x: int, y: int, b: Tuple[int, int, int, int]) -> bool:
 
 
 def ensure_current_dart(st: State) -> None:
+    """
+    For this tool we do NOT auto-create a dart on load (we load tips-only from src).
+    But once user starts interacting, ensure there's a current dart if list is empty.
+    """
     if not st.darts:
         st.darts.append(DartAnn())
         st.current = 0
@@ -136,6 +140,26 @@ def set_msg(st: State, msg: str, ttl: int = 90) -> None:
     st.msg_ttl = ttl
 
 
+def validate_for_save(darts: List[DartAnn]) -> Tuple[bool, str]:
+    """
+    Save gate:
+      - Every dart must have BOTH bbox and tip.
+      - Also blocks saving if darts list is empty (prevents accidental SPACE).
+    """
+    if not darts:
+        return False, "No darts to save. Press A to add a dart (or N to skip)."
+
+    for i, d in enumerate(darts):
+        idx = i + 1
+        if d.bbox is None and d.tip is None and d.tail is None:
+            return False, f"Dart {idx} is empty. Delete it (D) or label bbox+tip."
+        if d.bbox is None:
+            return False, f"Dart {idx}: missing BBOX. Draw bbox before saving."
+        if d.tip is None:
+            return False, f"Dart {idx}: missing TIP. Set tip before saving."
+    return True, ""
+
+
 # -----------------------------
 # I/O: load src ann (any format) -> keep ONLY TIP per dart
 # -----------------------------
@@ -146,7 +170,10 @@ def load_ann_any_format_keep_only_tip(path: Path) -> List[DartAnn]:
         { ..., "darts": [ { "bbox": [...], "tip": [...], "tail": [...] }, ... ] }
       OLD (v1):
         { ..., "bbox": [...], "tip": [...] }  # single dart (maybe no darts[])
-    Returns list where each dart keeps only `tip` (bbox/tail cleared).
+
+    IMPORTANT (your requested behavior):
+      - The number of darts loaded must equal the number of TIPS present.
+      - If an entry has no tip, it is skipped (no placeholder empty DartAnn).
     """
     if not path.exists():
         return []
@@ -163,8 +190,6 @@ def load_ann_any_format_keep_only_tip(path: Path) -> List[DartAnn]:
             tip = d.get("tip")
             if tip and isinstance(tip, (list, tuple)) and len(tip) == 2:
                 darts_out.append(DartAnn(bbox=None, tip=(int(tip[0]), int(tip[1])), tail=None))
-            else:
-                darts_out.append(DartAnn())
         return darts_out
 
     tip = data.get("tip") if isinstance(data, dict) else None
@@ -292,9 +317,8 @@ def _draw_loupe(out: np.ndarray, src: np.ndarray, center_xy: Tuple[int, int], ti
     H, W = out.shape[:2]
     cx, cy = center_xy
 
-    # Patch size (in source pixels) and zoom factor
-    half = 28   # patch radius (source)
-    zoom = 4    # scale up
+    half = 28
+    zoom = 4
 
     sx1 = clamp(cx - half, 0, W - 1)
     sy1 = clamp(cy - half, 0, H - 1)
@@ -312,47 +336,37 @@ def _draw_loupe(out: np.ndarray, src: np.ndarray, center_xy: Tuple[int, int], ti
     )
     ph, pw = patch_big.shape[:2]
 
-    # --- position the loupe near the cursor ---
     margin = 10
     offset_x = 20
     offset_y = 20
 
-    # default: to the right & below cursor
     ox1 = cx + offset_x
     oy1 = cy + offset_y
 
-    # If it would go off right edge, place it to the left of cursor
     if ox1 + pw + margin > W:
         ox1 = cx - offset_x - pw
-    # If it would go off bottom edge, place it above cursor
     if oy1 + ph + margin > H:
         oy1 = cy - offset_y - ph
 
-    # Clamp final position
     ox1 = clamp(ox1, margin, max(margin, W - pw - margin))
-    oy1 = clamp(oy1, margin + 28, max(margin + 28, H - ph - margin))  # +28 for title band
+    oy1 = clamp(oy1, margin + 28, max(margin + 28, H - ph - margin))
     ox2 = ox1 + pw
     oy2 = oy1 + ph
 
-    # Background panel (includes a title band above the patch)
     overlay = out.copy()
     cv2.rectangle(overlay, (ox1 - 4, oy1 - 28), (ox2 + 4, oy2 + 4), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.45, out, 0.55, 0, out)
 
-    # Paste patch
     out[oy1:oy2, ox1:ox2] = patch_big
 
-    # Border
     cv2.rectangle(out, (ox1 - 1, oy1 - 1), (ox2, oy2), (255, 255, 255), 1)
 
-    # Crosshair at patch center
     mx = ox1 + pw // 2
     my = oy1 + ph // 2
     cv2.line(out, (mx, oy1), (mx, oy2 - 1), (255, 255, 255), 1)
     cv2.line(out, (ox1, my), (ox2 - 1, my), (255, 255, 255), 1)
     cv2.circle(out, (mx, my), 4, (0, 255, 255), 1)
 
-    # Title
     cv2.putText(
         out,
         title,
@@ -365,12 +379,9 @@ def _draw_loupe(out: np.ndarray, src: np.ndarray, center_xy: Tuple[int, int], ti
     )
 
 
-
 def draw_overlay(img: np.ndarray, st: State) -> np.ndarray:
     out = img.copy()
     h, w = out.shape[:2]
-
-    ensure_current_dart(st)
 
     # show bbox preview while dragging
     if st.drawing and st.drag_start and st.drag_end:
@@ -379,7 +390,6 @@ def draw_overlay(img: np.ndarray, st: State) -> np.ndarray:
             x1, y1, x2, y2 = nb
             cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
-    # Which darts to draw?
     idxs = [st.current] if (st.hide_others and st.darts) else list(range(len(st.darts)))
 
     for i in idxs:
@@ -409,10 +419,10 @@ def draw_overlay(img: np.ndarray, st: State) -> np.ndarray:
         "a add | d del | [ ] switch | click bbox select | C copy prev | H toggle show-only-current",
         "t tip-mode (LMB/RMB sets tip) | e tail-mode (LMB sets tail)",
         "drag LMB draws bbox (when not in tip/tail mode)",
+        "SAVE RULE: ALL darts must have bbox + tip",
     ]
     _draw_panel_bottom_left(out, hud)
 
-    # Loupe: only when placing keypoints
     if st.mouse_xy is not None:
         if st.tip_mode:
             _draw_loupe(out, img, st.mouse_xy, "LOUPE: TIP (LMB/RMB)")
@@ -430,38 +440,24 @@ def draw_overlay(img: np.ndarray, st: State) -> np.ndarray:
 # Dataset scan & mapping
 # -----------------------------
 def scan_items_datav2(src_root: Path, dst_root: Path) -> List[Item]:
-    """
-    Scans annotations/data like your reviewer:
-      annotations/data/<session>/<cam>/images/*.jpg
-      annotations/data/<session>/<cam>/ann/*.json
-
-    Writes:
-      annotations/datav2/<session>/<cam>/ann/<stem>.json
-      annotations/datav2/<session>/<cam>/done/<stem>.done
-
-    Skips already-processed items (done exists OR dst ann exists).
-    """
     items: List[Item] = []
     img_exts = {".jpg", ".jpeg", ".png", ".webp"}
 
     if not src_root.exists():
         return items
 
-    # Prefer ".../images/*"
     for img_path in sorted(src_root.rglob("images/*")):
         if img_path.suffix.lower() not in img_exts:
             continue
         if "rejected" in [p.name for p in img_path.parents]:
             continue
 
-        images_dir = img_path.parent
-        cam_dir = images_dir.parent
-        ann_dir = cam_dir / "ann"
-        ann_src = ann_dir / f"{img_path.stem}.json"
+        cam_dir = img_path.parent.parent
+        ann_src = cam_dir / "ann" / f"{img_path.stem}.json"
 
-        rel = img_path.resolve().relative_to(src_root.resolve())  # <session>/<cam>/images/file.jpg
+        rel = img_path.resolve().relative_to(src_root.resolve())
         parts = list(rel.parts)
-        base_rel = Path(*parts[:-2])  # drop "images/<file>"
+        base_rel = Path(*parts[:-2])
 
         img_dst = dst_root / base_rel / "images" / img_path.name
         ann_dst = dst_root / base_rel / "ann" / f"{img_path.stem}.json"
@@ -481,7 +477,6 @@ def scan_items_datav2(src_root: Path, dst_root: Path) -> List[Item]:
     if items:
         return items
 
-    # Fallback: flat dirs
     for cam_dir in sorted(p for p in src_root.rglob("*") if p.is_dir()):
         if "rejected" in [p.name for p in cam_dir.parents] or cam_dir.name == "rejected":
             continue
@@ -491,7 +486,7 @@ def scan_items_datav2(src_root: Path, dst_root: Path) -> List[Item]:
 
         for img_path in imgs:
             ann_src = cam_dir / f"{img_path.stem}.json"
-            rel = img_path.resolve().relative_to(src_root.resolve())  # <session>/<cam>/<file>.jpg
+            rel = img_path.resolve().relative_to(src_root.resolve())
             base_rel = Path(*rel.parts[:-1])
 
             img_dst = dst_root / base_rel / "images" / img_path.name
@@ -541,13 +536,12 @@ def main() -> int:
         st.h, st.w = img.shape[:2]
 
         # Load SRC annotations but KEEP ONLY TIPS (clear bbox/tail)
+        # Number of darts = number of tips
         st.darts = load_ann_any_format_keep_only_tip(item.ann_path_src)
-        if not st.darts:
-            st.darts = [DartAnn()]
 
         st.current = 0
 
-        # IMPORTANT: start in BBOX mode
+        # start in BBOX mode
         st.tip_mode = False
         st.tail_mode = False
 
@@ -556,11 +550,14 @@ def main() -> int:
         st.drag_end = None
         st.mouse_xy = None
 
-        set_msg(st, "Loaded (tips kept from src). Start: BBOX mode. SPACE=save+next, K=copy prev, H=hide others", ttl=80)
+        if st.darts:
+            set_msg(st, f"Loaded {len(st.darts)} tips from src. Start: BBOX mode. SPACE=save+next", ttl=80)
+        else:
+            set_msg(st, "Loaded 0 tips from src. Press A to add dart if needed. SPACE will not save.", ttl=110)
+
         return True
 
     def select_dart_by_click(x: int, y: int) -> None:
-        # In hide-others mode, keep selection locked (unclickable others)
         if st.hide_others:
             return
         for i in range(len(st.darts) - 1, -1, -1):
@@ -574,31 +571,34 @@ def main() -> int:
         load_current()
 
     def save_and_mark_done_then_next() -> None:
-      item = st.items[st.idx]
+        ok, why = validate_for_save(st.darts)
+        if not ok:
+            set_msg(st, why, ttl=140)
+            return
 
-      # save annotation
-      save_ann_v2(
-          item.ann_path_dst,
-          item.img_path,
-          st.idx,
-          st.w,
-          st.h,
-          st.darts,
-      )
+        item = st.items[st.idx]
 
-      # copy image as "processed marker"
-      item.img_path_dst.parent.mkdir(parents=True, exist_ok=True)
-      shutil.copy2(item.img_path, item.img_path_dst)
+        save_ann_v2(
+            item.ann_path_dst,
+            item.img_path,
+            st.idx,
+            st.w,
+            st.h,
+            st.darts,
+        )
 
-      st.prev_darts = copy.deepcopy(st.darts)
-      set_msg(st, "SAVED -> datav2 (image + ann)", ttl=55)
+        item.img_path_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(item.img_path, item.img_path_dst)
 
-      # ADVANCE: remove current from queue and load next
-      st.items.pop(st.idx)
-      if not st.items:
-          return
-      st.idx = clamp(st.idx, 0, len(st.items) - 1)
-      load_current()
+        st.prev_darts = copy.deepcopy(st.darts)
+        set_msg(st, "SAVED -> datav2 (image + ann)", ttl=55)
+
+        # ADVANCE
+        st.items.pop(st.idx)
+        if not st.items:
+            return
+        st.idx = clamp(st.idx, 0, len(st.items) - 1)
+        load_current()
 
     def copy_prev_to_current() -> None:
         if not st.prev_darts:
@@ -606,11 +606,10 @@ def main() -> int:
             return
         st.darts = copy.deepcopy(st.prev_darts)
         st.current = 0
-        # stay in current mode (don’t force tip mode)
         st.drawing = False
         st.drag_start = None
         st.drag_end = None
-        set_msg(st, "Copied labels from previous (K)", ttl=60)
+        set_msg(st, "Copied labels from previous (C)", ttl=60)
 
     def toggle_hide_others() -> None:
         st.hide_others = not st.hide_others
@@ -635,17 +634,14 @@ def main() -> int:
             cur.tip = (clamp(x, 0, st.w - 1), clamp(y, 0, st.h - 1))
             return
 
-        # Tail mode: LMB sets tail
         if st.tail_mode and event == cv2.EVENT_LBUTTONDOWN:
             cur.tail = (clamp(x, 0, st.w - 1), clamp(y, 0, st.h - 1))
             return
 
-        # Tip mode: LMB sets tip
         if st.tip_mode and event == cv2.EVENT_LBUTTONDOWN:
             cur.tip = (clamp(x, 0, st.w - 1), clamp(y, 0, st.h - 1))
             return
 
-        # bbox draw (only when NOT in tip/tail)
         if (not st.tip_mode) and (not st.tail_mode):
             if event == cv2.EVENT_LBUTTONDOWN:
                 st.drawing = True
@@ -681,18 +677,16 @@ def main() -> int:
         if key in (0, 255):
             continue
 
-        # quit
         if key in (ord("q"), 27):
             break
 
-        # SPACE = save to datav2 + next
+        # SPACE = save to datav2 + next (guarded)
         if key == ord(" "):
             save_and_mark_done_then_next()
             if not st.items:
                 break
             continue
 
-        # prev/next without saving
         if key == ord("b"):
             jump(-1)
             continue
@@ -700,17 +694,14 @@ def main() -> int:
             jump(+1)
             continue
 
-        # copy previous labels onto current
         if key in (ord("c"), ord("C")):
             copy_prev_to_current()
             continue
 
-        # H show-only-current toggle
         if key in (ord("h"), ord("H")):
             toggle_hide_others()
             continue
 
-        # modes
         if key == ord("t"):
             st.tip_mode = not st.tip_mode
             if st.tip_mode:
@@ -725,7 +716,6 @@ def main() -> int:
             set_msg(st, f"Mode: {'TAIL' if st.tail_mode else 'BBOX'}", ttl=40)
             continue
 
-        # edit
         if key == ord("a"):
             add_new_dart(st)
             set_msg(st, "Added dart", ttl=40)
