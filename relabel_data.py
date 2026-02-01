@@ -146,8 +146,8 @@ def validate_for_save(darts: List[DartAnn]) -> Tuple[bool, str]:
       - Every dart must have BOTH bbox and tip.
       - Also blocks saving if darts list is empty (prevents accidental SPACE).
     """
-    if not darts:
-        return False, "No darts to save. Press A to add a dart (or N to skip)."
+    # if not darts:
+    #     return False, "No darts to save. Press A to add a dart (or N to skip)."
 
     for i, d in enumerate(darts):
         idx = i + 1

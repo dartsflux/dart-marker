@@ -30,7 +30,6 @@ def sha256_file(p: Path, chunk_size: int = 1024 * 1024) -> str:
 
 
 def pick_existing_image(img_dir: Path, stem: str) -> Optional[Path]:
-    # prefer common ext, but accept any
     for ext in (".jpg", ".jpeg", ".png"):
         p = img_dir / f"{stem}{ext}"
         if p.exists():
@@ -50,7 +49,23 @@ def _is_bbox(v) -> bool:
     return isinstance(v, list) and len(v) == 4 and all(isinstance(x, (int, float)) for x in v)
 
 
-def _validate_xy(issues: List[Issue], ann_path: Path, label: str, xy, w: int, h: int) -> None:
+def _validate_xy_required(
+    issues: List[Issue], ann_path: Path, label: str, xy, w: int, h: int
+) -> None:
+    if xy is None:
+        issues.append(Issue("schema", ann_path, f"{label} is required (not null)"))
+        return
+    if not _is_xy(xy):
+        issues.append(Issue("schema", ann_path, f"{label} must be list[2]"))
+        return
+    x, y = int(xy[0]), int(xy[1])
+    if not (0 <= x < w and 0 <= y < h):
+        issues.append(Issue("range", ann_path, f"{label} out of bounds {label}=({x},{y}) wh=({w},{h})"))
+
+
+def _validate_xy_optional(
+    issues: List[Issue], ann_path: Path, label: str, xy, w: int, h: int
+) -> None:
     if xy is None:
         return
     if not _is_xy(xy):
@@ -61,16 +76,33 @@ def _validate_xy(issues: List[Issue], ann_path: Path, label: str, xy, w: int, h:
         issues.append(Issue("range", ann_path, f"{label} out of bounds {label}=({x},{y}) wh=({w},{h})"))
 
 
+def _tip_inside_bbox(tip_xy, bbox) -> bool:
+    if tip_xy is None or bbox is None:
+        return True
+    if not _is_xy(tip_xy) or not _is_bbox(bbox):
+        return True
+    x, y = int(tip_xy[0]), int(tip_xy[1])
+    x1, y1, x2, y2 = map(int, bbox)
+    return (x1 <= x <= x2) and (y1 <= y <= y2)
+
+
 def validate_ann(ann_path: Path, ann: dict) -> List[Issue]:
+    """
+    New (datav2) expectations:
+      - keys: image, frame_idx, w, h, darts
+      - darts is a list of dicts
+      - each dart must have bbox (list[4]) and tip (list[2])  [REQUIRED]
+      - tail optional (list[2] or null)
+      - no 'empty' logic (ignored if present)
+    """
     issues: List[Issue] = []
 
-    # Required top-level keys (empty is optional now)
     required = ["image", "frame_idx", "w", "h", "darts"]
     for k in required:
         if k not in ann:
             issues.append(Issue("schema", ann_path, f"Missing key '{k}'"))
 
-    # Basic type checks (must establish darts before empty default)
+    # Establish top-level types
     try:
         w = int(ann.get("w", -1))
         h = int(ann.get("h", -1))
@@ -80,22 +112,9 @@ def validate_ann(ann_path: Path, ann: dict) -> List[Issue]:
         darts = ann.get("darts", None)
         if not isinstance(darts, list):
             raise ValueError("darts must be list")
-
-        empty = ann.get("empty", None)
-        if empty is None:
-            # default based on darts content
-            empty = (len(darts) == 0)
-        elif not isinstance(empty, bool):
-            raise ValueError("empty must be bool")
     except Exception as e:
         issues.append(Issue("schema", ann_path, f"Invalid top-level types: {e}"))
         return issues
-
-    # empty consistency
-    if empty and len(darts) != 0:
-        issues.append(Issue("schema", ann_path, f"empty=true but darts has {len(darts)} items"))
-    if (not empty) and len(darts) == 0:
-        issues.append(Issue("schema", ann_path, "empty=false but darts is empty"))
 
     # Validate each dart
     for i, d in enumerate(darts):
@@ -103,11 +122,11 @@ def validate_ann(ann_path: Path, ann: dict) -> List[Issue]:
             issues.append(Issue("schema", ann_path, f"darts[{i}] must be object"))
             continue
 
+        # bbox required
         if "bbox" not in d:
             issues.append(Issue("schema", ann_path, f"darts[{i}] missing 'bbox'"))
             continue
-
-        bbox = d.get("bbox")
+        bbox = d.get("bbox", None)
         if not _is_bbox(bbox):
             issues.append(Issue("schema", ann_path, f"darts[{i}].bbox must be list[4]"))
             continue
@@ -123,24 +142,22 @@ def validate_ann(ann_path: Path, ann: dict) -> List[Issue]:
         if abs(x2 - x1) < 5 or abs(y2 - y1) < 5:
             issues.append(Issue("bbox_small", ann_path, f"darts[{i}].bbox too small: {bbox}"))
 
+        # tip required
         tip = d.get("tip", None)
-        tail = d.get("tail", None)
+        _validate_xy_required(issues, ann_path, f"darts[{i}].tip", tip, w, h)
 
-        _validate_xy(issues, ann_path, f"darts[{i}].tip", tip, w, h)
-        _validate_xy(issues, ann_path, f"darts[{i}].tail", tail, w, h)
+        # tail optional
+        tail = d.get("tail", None)
+        _validate_xy_optional(issues, ann_path, f"darts[{i}].tail", tail, w, h)
+
+        # helpful consistency check: tip should be inside bbox
+        if tip is not None and _is_xy(tip) and _is_bbox(bbox) and not _tip_inside_bbox(tip, bbox):
+            issues.append(Issue("tip_outside_bbox", ann_path, f"darts[{i}].tip {tip} is outside bbox {bbox}"))
 
     return issues
 
 
 def audit_pair_folder(pair_root: Path, check_dupes: bool) -> Tuple[Dict[str, int], List[Issue], Dict[str, List[Path]]]:
-    """
-    pair_root is a folder that contains:
-      - images/
-      - ann/
-
-    Returns:
-      counts, issues, dupes
-    """
     issues: List[Issue] = []
     dupes: Dict[str, List[Path]] = {}
 
@@ -199,10 +216,6 @@ def audit_pair_folder(pair_root: Path, check_dupes: bool) -> Tuple[Dict[str, int
 
 
 def find_pair_folders(root: Path) -> List[Path]:
-    """
-    Find any directory under root that contains both 'images' and 'ann' subfolders.
-    Returns the parent directories (pair_root).
-    """
     pair_roots: List[Path] = []
     if not root.exists():
         return pair_roots
@@ -225,7 +238,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--root",
-        default="annotations/data",
+        default="annotations/datav2",
         help="Root to scan (default: annotations/data). Scans recursively for folders containing images/ and ann/.",
     )
     ap.add_argument("--dupes", action="store_true", help="Hash images to find duplicates (slower)")
@@ -244,7 +257,7 @@ def main() -> int:
     pair_roots = find_pair_folders(root)
     extra_pair_roots: List[Path] = []
 
-    rejected_root = root.parent / "rejected"  # annotations/rejected
+    rejected_root = root.parent / "rejected"
     if args.include_rejected and rejected_root.exists():
         extra_pair_roots = find_pair_folders(rejected_root)
 
