@@ -88,7 +88,15 @@ def write_yolo_label_pose2(
         if not bbox or len(bbox) != 4:
             continue
 
-        x1, y1, x2, y2 = map(float, bbox)
+        # normalize bbox (direction-agnostic)
+        x1, x2 = sorted((float(bbox[0]), float(bbox[2])))
+        y1, y2 = sorted((float(bbox[1]), float(bbox[3])))
+
+        # sanity checks
+        if (x2 - x1) < 2 or (y2 - y1) < 2:
+            continue
+        if not (0 <= x1 < w and 0 < x2 <= w and 0 <= y1 < h and 0 < y2 <= h):
+            continue
 
         # bbox -> normalized cx,cy,w,h
         bw = (x2 - x1) / w
@@ -98,13 +106,17 @@ def write_yolo_label_pose2(
 
         # tip kp
         tip = d.get("tip")
-        if tip and len(tip) == 2:
-            tx, ty = map(float, tip)
-            tipx = tx / w
-            tipy = ty / h
-            tipv = 2
-        else:
-            tipx, tipy, tipv = 0.0, 0.0, 0
+        if not (tip and len(tip) == 2):
+            # datav2 policy: require tip for a labeled object
+            continue
+
+        tx, ty = map(float, tip)
+        if not (0 <= tx < w and 0 <= ty < h):
+            continue
+
+        tipx = tx / w
+        tipy = ty / h
+        tipv = 2
 
         # tail kp
         tail = d.get("tail")
@@ -129,8 +141,8 @@ def write_yolo_label_pose2(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src", default="annotations/data", help="Input root (default: annotations/data)")
-    ap.add_argument("--dst", default="datasets/yolo_dart_pose_tip_tail", help="Output YOLO dataset folder")
+    ap.add_argument("--src", default="annotations/datav2", help="Input root (default: annotations/data)")
+    ap.add_argument("--dst", default="datasets/yolo_dart_v1", help="Output YOLO dataset folder")
     ap.add_argument("--val", type=float, default=0.1, help="Validation split fraction (default 0.1)")
     ap.add_argument("--seed", type=int, default=1337, help="Random seed")
     ap.add_argument("--copy", action="store_true", help="Copy images (default is hardlink when possible)")

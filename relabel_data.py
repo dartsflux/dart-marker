@@ -487,7 +487,7 @@ def scan_items_datav2(src_root: Path, dst_root: Path) -> List[Item]:
         for img_path in imgs:
             ann_src = cam_dir / f"{img_path.stem}.json"
             rel = img_path.resolve().relative_to(src_root.resolve())
-            base_rel = Path(*rel.parts[:-1])
+            base_rel = Path(*rel.parts[:-2])
 
             img_dst = dst_root / base_rel / "images" / img_path.name
             ann_dst = dst_root / base_rel / "ann" / f"{img_path.stem}.json"
