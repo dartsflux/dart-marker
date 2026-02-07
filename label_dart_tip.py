@@ -272,8 +272,9 @@ def save_annot(
         "frame_idx": int(frame_idx),
         "w": int(w),
         "h": int(h),
-        "empty": empty,
         "darts": darts_out,
+        "format": "datav2",
+        "note": "video label tool",
     }
     ann_dir.mkdir(parents=True, exist_ok=True)
     ann_path.write_text(json.dumps(ann, indent=2), encoding="utf-8")

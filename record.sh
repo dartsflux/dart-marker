@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-FPS=33
+FPS=15
 SIZE=1280x720
-IN_PIX=uyvy422
+# NOTE: forcing IN_PIX can break/stall multi-cam on macOS.
+# Leave empty to let avfoundation choose a stable format.
+IN_PIX=""   # e.g. "uyvy422" if you *really* want; default "" (recommended)
 
 ENC=h264_videotoolbox
 BITRATE=6M
 
+# Set any CAM* to -1 to disable it.
 CAM1=0
 CAM2=1
-CAM3=2
+CAM3=-1
+CAM4=-1
+CAM5=-1
 
 # ---- preflight settings ----
 HASH_W=32
 HASH_H=32
-PROBE_TIMEOUT_SEC=2
 PROBE_RETRIES=5
 PROBE_SLEEP=0.4
 
@@ -23,15 +27,25 @@ ts=$(date +"%Y%m%d_%H%M%S")
 outdir="videos/$ts"
 mkdir -p "$outdir"
 
+# ---- collect enabled camera indices in order ----
+CAMS=()
+for v in "$CAM1" "$CAM2" "$CAM3" "$CAM4" "$CAM5"; do
+  if [[ "${v}" != "-1" ]]; then
+    CAMS+=("$v")
+  fi
+done
+
+if [[ "${#CAMS[@]}" -eq 0 ]]; then
+  echo "[FATAL] No cameras enabled. Set CAM1..CAM5 to indices (0,1,2,...) and use -1 to disable."
+  exit 1
+fi
+
 echo "Recording to: $outdir"
-echo "Cameras: $CAM1 $CAM2 $CAM3"
+echo "Cameras enabled (${#CAMS[@]}): ${CAMS[*]}"
 
 # ---- helpers ----
 hash_cam() {
   local cam_idx="$1"
-
-  # Use a supported framerate (15) so avfoundation can open the device.
-  # Keep it short but give it time to deliver one frame.
   local out
   out="$(
     ffmpeg -hide_banner -loglevel error -nostdin \
@@ -54,27 +68,41 @@ hash_cam() {
 }
 
 check_duplicates() {
-  local h1 h2 h3
-  h1="$(hash_cam "$CAM1" || true)"
-  h2="$(hash_cam "$CAM2" || true)"
-  h3="$(hash_cam "$CAM3" || true)"
+  local -a hashes=()
+  local cam_idx h
+
+  for cam_idx in "${CAMS[@]}"; do
+    h="$(hash_cam "$cam_idx" || true)"
+    hashes+=("$h")
+  done
 
   # Basic sanity: did we get hashes?
-  if [[ -z "$h1" || -z "$h2" || -z "$h3" ]]; then
-    echo "[WARN] Preflight: could not read all cameras (h1='${h1}', h2='${h2}', h3='${h3}')"
-    return 2
-  fi
+  local i
+  for i in "${!CAMS[@]}"; do
+    if [[ -z "${hashes[$i]}" ]]; then
+      echo "[WARN] Preflight: could not read cam${i} (idx=${CAMS[$i]})"
+      return 2
+    fi
+  done
 
   echo "[INFO] Preflight hashes:"
-  echo "  cam1($CAM1) $h1"
-  echo "  cam2($CAM2) $h2"
-  echo "  cam3($CAM3) $h3"
+  for i in "${!CAMS[@]}"; do
+    printf "  cam%d(%s) %s\n" "$((i+1))" "${CAMS[$i]}" "${hashes[$i]}"
+  done
 
-  # Duplicate detection
-  if [[ "$h1" == "$h2" || "$h1" == "$h3" || "$h2" == "$h3" ]]; then
-    echo "[ERR] Preflight: duplicate camera feeds detected (two indices look identical)."
-    return 1
-  fi
+  # Duplicate detection (pairwise)
+  local a b
+  for a in "${!hashes[@]}"; do
+    for b in "${!hashes[@]}"; do
+      if (( b <= a )); then
+        continue
+      fi
+      if [[ "${hashes[$a]}" == "${hashes[$b]}" ]]; then
+        echo "[ERR] Preflight: duplicate camera feeds detected between cam$((a+1)) (idx=${CAMS[$a]}) and cam$((b+1)) (idx=${CAMS[$b]})."
+        return 1
+      fi
+    done
+  done
 
   return 0
 }
@@ -104,15 +132,38 @@ fi
 echo "Preflight OK ✅"
 echo "Press ENTER to stop."
 
+# ---- build ffmpeg args dynamically ----
+ff_args=(
+  -hide_banner -loglevel info
+)
+
+# Inputs
+for cam_idx in "${CAMS[@]}"; do
+  ff_args+=(
+    -thread_queue_size 1024
+    -f avfoundation
+    -framerate "$FPS"
+    -video_size "$SIZE"
+  )
+  if [[ -n "${IN_PIX}" ]]; then
+    ff_args+=(-pix_fmt "$IN_PIX")
+  fi
+  ff_args+=(-i "${cam_idx}:none")
+done
+
+# Outputs (one file per input)
+for i in "${!CAMS[@]}"; do
+  out="cam$((i+1)).mp4"
+  ff_args+=(
+    -map "${i}:v"
+    -c:v "$ENC"
+    -b:v "$BITRATE"
+    "$outdir/$out"
+  )
+done
+
 # ---- record with ONE ffmpeg process (reduces avfoundation race) ----
-ffmpeg -hide_banner -loglevel info \
-  -f avfoundation -framerate "$FPS" -video_size "$SIZE" -pix_fmt "$IN_PIX" -i "${CAM1}:none" \
-  -f avfoundation -framerate "$FPS" -video_size "$SIZE" -pix_fmt "$IN_PIX" -i "${CAM2}:none" \
-  -f avfoundation -framerate "$FPS" -video_size "$SIZE" -pix_fmt "$IN_PIX" -i "${CAM3}:none" \
-  -map 0:v -c:v "$ENC" -b:v "$BITRATE" "$outdir/cam1.mp4" \
-  -map 1:v -c:v "$ENC" -b:v "$BITRATE" "$outdir/cam2.mp4" \
-  -map 2:v -c:v "$ENC" -b:v "$BITRATE" "$outdir/cam3.mp4" \
-  >"$outdir/ffmpeg.log" 2>&1 &
+ffmpeg "${ff_args[@]}" >"$outdir/ffmpeg.log" 2>&1 &
 ffmpeg_pid=$!
 
 read -r
